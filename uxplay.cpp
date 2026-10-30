@@ -4,6 +4,7 @@
  * Modified extensively to become 
  * UxPlay - An open-souce AirPlay mirroring server.
  * Modifications Copyright (C) 2021-23 F. Duncanh
+ * Modified 2026-10-31 by colaH16: -async client clock offset handling (see FORK.md)
  *
  * This program is free software; you can redistribute it and/or modify
  * it under the terms of the GNU General Public License as published by
@@ -155,6 +156,7 @@ static bool nofreeze = false;
 static unsigned short raop_port;
 static unsigned short airplay_port;
 static uint64_t remote_clock_offset = 0;
+static bool remote_clock_offset_from_ntp = false;
 static std::vector<std::string> allowed_clients;
 static std::vector<std::string> blocked_clients;
 static bool restrict_clients;
@@ -2300,9 +2302,15 @@ extern "C" void audio_process (void *cls, raop_ntp_t *ntp, audio_decode_struct *
         mux_renderer_push_audio(data->data, data->data_len, data->ntp_time_remote);
     }
     if (use_audio) {
-        if (!remote_clock_offset) {
+        /* an offset guessed from the local clock before NTP synced would pin ALAC audio to
+         * "play now" (no -async delay) for the rest of the connection: replace it once NTP syncs */
+        bool replace_guess = (data->ct == 2 && !remote_clock_offset_from_ntp && data->ntp_time_local);
+        if (!remote_clock_offset || replace_guess) {
             uint64_t local_time = (data->ntp_time_local ? data->ntp_time_local : get_local_time());
             remote_clock_offset = local_time - data->ntp_time_remote;
+            remote_clock_offset_from_ntp = (data->ntp_time_local != 0);
+            LOGI("audio clock offset (local - client) %+.6f secs%s", (double) (int64_t) remote_clock_offset / SECOND_IN_NSECS,
+                 remote_clock_offset_from_ntp ? "" : " (NTP not synced yet)");
         }
         data->ntp_time_remote = data->ntp_time_remote + remote_clock_offset;
         switch (data->ct) {
@@ -2440,6 +2448,10 @@ extern "C" void audio_set_volume (void *cls, float volume) {
 extern "C" void audio_get_format (void *cls, unsigned char *ct, unsigned short *spf, bool *usingScreen, bool *isMedia, uint64_t *audioFormat) {
     unsigned char type;
     LOGI("ct=%d spf=%d usingScreen=%d isMedia=%d  audioFormat=0x%lx",*ct, *spf, *usingScreen, *isMedia, (unsigned long) *audioFormat);
+    if (!*usingScreen) {
+        /* each Audio-Only stream recomputes the client clock offset used for -async */
+        remote_clock_offset = 0;
+    }
     switch (*ct) {
     case 2:
         type = 0x20;
